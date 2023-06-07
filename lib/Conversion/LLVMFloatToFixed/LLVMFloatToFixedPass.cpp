@@ -238,7 +238,10 @@ void FloatToFixed::openPhiLoop(PHINode *phi)
   phi->replaceAllUsesWith(info.placeh_noconv);
   cpMetaData(info.placeh_noconv, phi);
   if (isFloatingPointToConvert(phi)) {
-    Type *convt = getLLVMFixedPointTypeForFloatType(phi->getType(), fixPType(phi));
+    FixedPointType fixpt = fixPType(phi);
+    Type *convt = getLLVMFixedPointTypeForFloatType(phi->getType(), fixpt);
+    if (fixpt.isPosit())
+      convt = PointerType::get(convt, 0);
     info.placeh_conv = createPlaceholder(convt, phi->getParent(), "phi_conv");
     *(newValueInfo(info.placeh_conv)) = *(valueInfo(phi));
     cpMetaData(info.placeh_conv, phi);
@@ -684,6 +687,10 @@ Function *FloatToFixed::createFixFun(CallBase *call, bool *old)
     if (hasInfo(v)) {
       fixArgs.push_back(std::pair<int, FixedPointType>(i, valueInfo(v)->fixpType));
       newTy = getLLVMFixedPointTypeForFloatValue(v);
+      if (fixPType(v).isPosit() && !newTy->isPointerTy()) {
+        // Posits are always memory allocated and should be passed by pointer
+        newTy = PointerType::get(newTy, 0);
+      }
     } else {
       newTy = v->getType();
     }

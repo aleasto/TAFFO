@@ -380,6 +380,9 @@ struct FloatToFixed {
       il rispettivo value è un fix che deve essere convertito in float per
       retrocompatibilità. Se la chiave non è un float allora uso il rispettivo
       value associato così com'è.*/
+    if (origType->isFloatingPointTy()) {
+      return genConvertFixToFloat(cvtfallval, fixPType(cvtfallval), origType, ip);
+    }
     if (cvtfallval->getType()->isPointerTy() &&
         cvtfallval->getType() != origType) {
       llvm::BitCastInst *bc = new llvm::BitCastInst(cvtfallval, origType);
@@ -387,8 +390,6 @@ struct FloatToFixed {
       bc->insertBefore(ip);
       return bc;
     }
-    if (origType->isFloatingPointTy())
-      return genConvertFixToFloat(cvtfallval, fixPType(cvtfallval), origType, ip);
     return cvtfallval;
   }
 
@@ -551,7 +552,7 @@ struct FloatToFixed {
     else
       ty = val->getType();
     llvm::Type *fuwt = taffo::fullyUnwrapPointerOrArrayType(ty);
-    if (!fuwt->isStructTy()) {
+    if (!fuwt->isStructTy() || fuwt == vi->fixpType.scalarToLLVMType(val->getContext())) {
       if (!taffo::isFloatType(ty))
         return false;
     }

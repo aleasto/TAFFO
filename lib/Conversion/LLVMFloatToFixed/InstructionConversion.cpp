@@ -1,5 +1,6 @@
 #include "DataTypeAlloc/TaffoDTA/DTAConfig.h"
 #include "LLVMFloatToFixedPass.h"
+#include "PositBuilder.h"
 #include "TypeUtils.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APSInt.h"
@@ -131,6 +132,17 @@ Value *FloatToFixed::convertLoad(LoadInst *load, FixedPointType &fixpt, Module &
     return Unsupported;
   if (isConvertedFixedPoint(newptr)) {
     fixpt = fixPType(newptr);
+    if (fixpt.isPosit() && !load->getType()->isPointerTy()) {
+      // Create a copy in memory and return the address
+      if (valueInfo(load)->noTypeConversion) {
+        return genConvertFixToFloat(newptr, fixpt, load->getType(), load);
+      }
+      IRBuilder<NoFolder> builder(load);
+      Value *var = builder.CreateAlloca(fixpt.scalarToLLVMType(load->getContext()));
+      PositBuilder(builder, fixpt).CreateCopy(var, newptr);
+      return var;
+    }
+
     Type *PELType = newptr->getType()->getPointerElementType();
     Align align;
     if (load->getFunction()->getCallingConv() == CallingConv::SPIR_KERNEL || mdutils::MetadataManager::isCudaKernel(m, load->getFunction())) {
@@ -223,11 +235,17 @@ Value *FloatToFixed::convertStore(StoreInst *store, Module &m)
   } else {
     align = store->getAlign();
   }
-  StoreInst *newinst =
-      new StoreInst(newval, newptr, store->isVolatile(), align,
+
+  if (isConvertedFixedPoint(newptr) && fixPType(newptr).isPosit() && !peltype->isPointerTy()) {
+    // Store of a posit, both source and destination are memory locations
+    IRBuilder<NoFolder> builder(store);
+    return PositBuilder(builder, fixPType(newptr)).CreateCopy(newptr, newval, store->isVolatile());
+  } else {
+    StoreInst *newinst = new StoreInst(newval, newptr, store->isVolatile(), align,
                     store->getOrdering(), store->getSyncScopeID());
-  newinst->insertAfter(store);
-  return newinst;
+    newinst->insertAfter(store);
+    return newinst;
+  }
 }
 
 
@@ -328,8 +346,10 @@ Value *FloatToFixed::convertPhi(PHINode *phi, FixedPointType &fixpt)
   /* if we have to do a type change, create a new phi node. The new type is for
    * sure that of a fixed point value; because the original type was a float
    * and thus all of its incoming values were floats */
-  PHINode *newphi = PHINode::Create(fixpt.scalarToLLVMType(phi->getContext()),
-                                    phi->getNumIncomingValues());
+  Type *t = fixpt.scalarToLLVMType(phi->getContext());
+  if (fixpt.isPosit())
+    t = PointerType::get(t, 0);
+  PHINode *newphi = PHINode::Create(t, phi->getNumIncomingValues());
   for (unsigned i = 0; i < phi->getNumIncomingValues(); i++) {
     Value *thisval = phi->getIncomingValue(i);
     BasicBlock *thisbb = phi->getIncomingBlock(i);
@@ -463,17 +483,25 @@ Value *FloatToFixed::convertCall(CallBase *call, FixedPointType &fixpt)
     call_arg++;
     f_arg++;
   }
+  IRBuilder<NoFolder> builder(call);
   if (isa<CallInst>(call)) {
-    CallInst *newCall = CallInst::Create(newF, convArgs);
+    CallInst *newCall = builder.CreateCall(newF, convArgs);
     newCall->setCallingConv(call->getCallingConv());
-    newCall->insertBefore(call);
+    if (isFloatType(oldF->getReturnType()) && fixpt.isPosit() && !oldF->getReturnType()->isPointerTy()) {
+      // Posits are stored in memory but can be returned by-value.
+      // We, the callee, should move it to our memory
+      Type *positType = fixpt.scalarToLLVMType(call->getContext());
+      assert(newF->getReturnType() == positType && "Mismatching Posit return type");
+      Value *var = builder.CreateAlloca(positType);
+      builder.CreateStore(newCall, var);
+      return var;
+    }
     return newCall;
   } else if (isa<InvokeInst>(call)) {
     InvokeInst *invk = dyn_cast<InvokeInst>(call);
-    InvokeInst *newInvk = InvokeInst::Create(newF, invk->getNormalDest(),
+    InvokeInst *newInvk = builder.CreateInvoke(newF, invk->getNormalDest(),
                                              invk->getUnwindDest(), convArgs);
     newInvk->setCallingConv(call->getCallingConv());
-    newInvk->insertBefore(invk);
     return newInvk;
   }
   assert(false && "Unknown CallBase type");
@@ -492,6 +520,14 @@ Value *FloatToFixed::convertRet(ReturnInst *ret, FixedPointType &fixpt)
   }
   Function *f = dyn_cast<Function>(ret->getParent()->getParent());
   Value *v = translateOrMatchAnyOperandAndType(oldv, fixpt);
+  if (fixpt.isPosit() && !oldv->getType()->isPointerTy()) {
+    // Posits are stored in memory but we can return by-value,
+    // then the callee will move it to its own memory
+    IRBuilder<NoFolder> builder(ret);
+    ValueInfo vi = *valueInfo(v);
+    v = builder.CreateLoad(fixpt.scalarToLLVMType(ret->getContext()), v);
+    *newValueInfo(v) = vi;
+  }
   // check return type
   if (f->getReturnType() != v->getType())
     return nullptr;
@@ -522,7 +558,8 @@ Value *FloatToFixed::convertUnaryOp(Instruction *instr,
       fixop = builder.CreateNeg(val1);
     } else if (fixpt.isFloatingPoint()) {
       fixop = builder.CreateFNeg(val1);
-
+    } else if (fixpt.isPosit()) {
+      return PositBuilder(builder, fixpt).CreateUnaryOp(Instruction::FNeg, val1);
     } else {
       llvm_unreachable("Unknown variable type. Are you trying to implement a "
                        "new datatype?");
@@ -564,6 +601,8 @@ Value *FloatToFixed::convertBinOp(Instruction *instr,
         fixop = builder.CreateBinOp(Instruction::Add, val1, val2);
       } else if (fixpt.isFloatingPoint()) {
         fixop = builder.CreateBinOp(Instruction::FAdd, val1, val2);
+      } else if (fixpt.isPosit()) {
+        return PositBuilder(builder, fixpt).CreateBinOp(Instruction::FAdd, val1, val2);
       } else {
         llvm_unreachable("Unknown variable type. Are you trying to implement a "
                          "new datatype?");
@@ -581,6 +620,8 @@ Value *FloatToFixed::convertBinOp(Instruction *instr,
         LLVM_DEBUG(dbgs() << "\n";);
       } else if (fixpt.isFloatingPoint()) {
         fixop = builder.CreateBinOp(Instruction::FSub, val1, val2);
+      } else if (fixpt.isPosit()) {
+        return PositBuilder(builder, fixpt).CreateBinOp(Instruction::FSub, val1, val2);
       } else {
         llvm_unreachable("Unknown variable type. Are you trying to implement a "
                          "new datatype?");
@@ -593,6 +634,8 @@ Value *FloatToFixed::convertBinOp(Instruction *instr,
           fixop = builder.CreateBinOp(Instruction::URem, val1, val2);
       } else if (fixpt.isFloatingPoint()) {
         fixop = builder.CreateBinOp(Instruction::FRem, val1, val2);
+      } else if (fixpt.isPosit()) {
+        return PositBuilder(builder, fixpt).CreateBinOp(Instruction::FRem, val1, val2);
       } else {
         llvm_unreachable("Unknown variable type. Are you trying to implement a "
                          "new datatype?");
@@ -736,7 +779,7 @@ Value *FloatToFixed::convertBinOp(Instruction *instr,
         return genConvertFixedToFixed(fixop, intermtype, fixpt, instr);
       }
 
-    } else if (fixpt.isFloatingPoint()) {
+    } else if (fixpt.isFloatingPoint() || fixpt.isPosit()) {
       Value *val1 = translateOrMatchOperand(instr->getOperand(0), intype1,
                                             instr, TypeMatchPolicy::ForceHint);
       Value *val2 = translateOrMatchOperand(instr->getOperand(1), intype2,
@@ -744,8 +787,10 @@ Value *FloatToFixed::convertBinOp(Instruction *instr,
       if (!val1 || !val2)
         return nullptr;
       IRBuilder<NoFolder> builder(instr);
-      Value *fltop = builder.CreateFMul(val1, val2);
-      return fltop;
+      if (fixpt.isFloatingPoint())
+        return builder.CreateFMul(val1, val2);
+      else // fixpt.isPosit()
+        return PositBuilder(builder, fixpt).CreateBinOp(Instruction::FMul, val1, val2);
     } else {
       llvm_unreachable(
           "Unknown variable type. Are you trying to implement a new datatype?");
@@ -812,7 +857,7 @@ Value *FloatToFixed::convertBinOp(Instruction *instr,
       updateConstTypeMetadata(fixop, 0U, ext1type);
       updateConstTypeMetadata(fixop, 1U, ext2type);
       return genConvertFixedToFixed(fixop, fixoptype, fixpt, instr);
-    } else if (fixpt.isFloatingPoint()) {
+    } else if (fixpt.isFloatingPoint() || fixpt.isPosit()) {
       Value *val1 = translateOrMatchOperand(instr->getOperand(0), intype1,
                                             instr, TypeMatchPolicy::ForceHint);
       Value *val2 = translateOrMatchOperand(instr->getOperand(1), intype2,
@@ -820,8 +865,10 @@ Value *FloatToFixed::convertBinOp(Instruction *instr,
       if (!val1 || !val2)
         return nullptr;
       IRBuilder<NoFolder> builder(instr);
-      Value *fltop = builder.CreateFDiv(val1, val2);
-      return fltop;
+      if (fixpt.isFloatingPoint())
+        return builder.CreateFDiv(val1, val2);
+      else // fixpt.isPosit()
+        return PositBuilder(builder, fixpt).CreateBinOp(Instruction::FDiv, val1, val2);
     } else {
       llvm_unreachable(
           "Unknown variable type. Are you trying to implement a new datatype?");
@@ -855,16 +902,22 @@ Value *FloatToFixed::convertCmp(FCmpInst *fcmp)
     isOneFloat = t2.isFloatingPoint();
   }
   if (!isOneFloat) {
-    bool mixedsign = t1.scalarIsSigned() != t2.scalarIsSigned();
-    int intpart1 = t1.scalarBitsAmt() - t1.scalarFracBitsAmt() +
-                   (mixedsign ? t1.scalarIsSigned() : 0);
-    int intpart2 = t2.scalarBitsAmt() - t2.scalarFracBitsAmt() +
-                   (mixedsign ? t2.scalarIsSigned() : 0);
-    cmptype.scalarIsSigned() = t1.scalarIsSigned() || t2.scalarIsSigned();
-    cmptype.scalarFracBitsAmt() =
-        std::max(t1.scalarFracBitsAmt(), t2.scalarFracBitsAmt());
-    cmptype.scalarBitsAmt() =
-        std::max(intpart1, intpart2) + cmptype.scalarFracBitsAmt();
+    if (t1.isPosit() || t2.isPosit()) {
+      assert((t1.isPosit() && t2.isPosit()) && "Cannot compare posit to fixed point");
+      cmptype = t1;
+      cmptype.scalarBitsAmt() = std::max(t1.scalarBitsAmt(), t2.scalarBitsAmt());
+    } else {
+      bool mixedsign = t1.scalarIsSigned() != t2.scalarIsSigned();
+      int intpart1 = t1.scalarBitsAmt() - t1.scalarFracBitsAmt() +
+                     (mixedsign ? t1.scalarIsSigned() : 0);
+      int intpart2 = t2.scalarBitsAmt() - t2.scalarFracBitsAmt() +
+                     (mixedsign ? t2.scalarIsSigned() : 0);
+      cmptype.scalarIsSigned() = t1.scalarIsSigned() || t2.scalarIsSigned();
+      cmptype.scalarFracBitsAmt() =
+          std::max(t1.scalarFracBitsAmt(), t2.scalarFracBitsAmt());
+      cmptype.scalarBitsAmt() =
+          std::max(intpart1, intpart2) + cmptype.scalarFracBitsAmt();
+    }
     Value *val1 = translateOrMatchOperandAndType(op1, cmptype, fcmp);
     Value *val2 = translateOrMatchOperandAndType(op2, cmptype, fcmp);
     IRBuilder<NoFolder> builder(fcmp->getNextNode());
@@ -905,6 +958,9 @@ Value *FloatToFixed::convertCmp(FCmpInst *fcmp)
     if (swapped) {
       ty = CmpInst::getInversePredicate(ty);
     }
+
+    if (cmptype.isPosit())
+      return val1 && val2 ? PositBuilder(builder, cmptype).CreateCmp(ty, val1, val2) : nullptr;
     return val1 && val2 ? builder.CreateICmp(ty, val1, val2) : nullptr;
   } else {
     // Handling the presence of at least one float:
