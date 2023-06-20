@@ -388,7 +388,7 @@ struct FloatToFixed {
       return bc;
     }
     if (origType->isFloatingPointTy())
-      return genConvertFixToFloat(cvtfallval, fixPType(cvtfallval), origType);
+      return genConvertFixToFloat(cvtfallval, fixPType(cvtfallval), origType, ip);
     return cvtfallval;
   }
 
@@ -416,7 +416,8 @@ struct FloatToFixed {
    *  @returns The converted value. */
   llvm::Value *genConvertFixToFloat(llvm::Value *fix,
                                     const FixedPointType &fixpt,
-                                    llvm::Type *destt);
+                                    llvm::Type *destt,
+                                    llvm::Instruction *ip = nullptr);
 
   /** Generate code for converting between two fixed point formats.
    *  @param flt A fixed point scalar value.
