@@ -179,6 +179,7 @@ void closeMallocLikeHandler(Module &m, const MLHVec &vec)
 
 PreservedAnalyses FloatToFixed::run(Module &m, ModuleAnalysisManager &AM)
 {
+  ModulePtr = &m;
   MAM = &AM;
   ModuleDL = &(m.getDataLayout());
 

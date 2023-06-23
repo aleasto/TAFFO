@@ -677,7 +677,12 @@ struct FloatToFixed {
 
   void handleKmpcFork(llvm::CallInst *patchedDirectCall, llvm::Function *indirectFunction);
 
+  llvm::Module *getModule() {
+    return ModulePtr;
+  }
+
 private:
+  llvm::Module *ModulePtr;
   llvm::ModuleAnalysisManager *MAM;
   const llvm::DataLayout *ModuleDL;
 };
