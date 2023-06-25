@@ -20,6 +20,9 @@ endif
 ifeq ($(TAFFO_DTA),mixed) #ilp
 TAFFO_EXEC_OPTS   += -mixedmode -costmodel i7-4 -instructionset fix
 endif
+ifeq ($(TAFFO_DTA),posit)
+TAFFO_EXEC_OPTS   += -Xdta -useposit -lTaffoPosit
+endif
 
 ifeq ($(MAKECMDGOALS),)
 $(info DTA config type = $(TAFFO_DTA))
